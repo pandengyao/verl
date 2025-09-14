@@ -46,20 +46,16 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         with simple_timer("generate_sequences", metrics):
-            print(f"[SingleTurnAgent] Calling server_manager.generate:")
-            print(f"  request_id: {request_id}")
-            print(f"  prompt_ids: {prompt_ids}")
-            print(f"  sampling_params: {sampling_params}")
+            print(f"[SingleTurnAgentLoop.run] request_id: {request_id}")
+            print(f"[SingleTurnAgentLoop.run] prompt_ids: {prompt_ids}")
+            print(f"[SingleTurnAgentLoop.run] sampling_params: {sampling_params}")
             
             output = await self.server_manager.generate(
                 request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
             )
             
-            print(f"[SingleTurnAgent] Server output: {output}")
-            print(f"[SingleTurnAgent] Output type: {type(output)}")
-            print(f"[SingleTurnAgent] Token IDs: {output.token_ids}")
-            print(f"[SingleTurnAgent] Log probs: {output.log_probs}")
-            
+            print(f"[SingleTurnAgentLoop.run] output: {output}")
+
         response_mask = [1] * len(output.token_ids)
 
         output = AgentLoopOutput(
