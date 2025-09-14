@@ -113,6 +113,7 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        print(f"[ToolAgentLoop] Messages: {messages}")
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
         metrics = {}
         request_id = uuid4().hex
@@ -240,9 +241,19 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Handle interaction if needed
         if self.interaction_config_file:
+            print(f"[AgentLoop] Decoding response_ids to text:")
+            print(f"  response_ids: {agent_data.response_ids}")
+            print(f"  response_ids type: {type(agent_data.response_ids)}")
+            print(f"  response_ids length: {len(agent_data.response_ids)}")
+            
             assistant_message = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.decode(agent_data.response_ids)
             )
+            
+            print(f"[AgentLoop] Decoded text: '{assistant_message}'")
+            print(f"[AgentLoop] Decoded text type: {type(assistant_message)}")
+            print(f"[AgentLoop] Decoded text length: {len(assistant_message)}")
+            
             add_messages.append({"role": "assistant", "content": assistant_message})
             agent_data.messages.extend(add_messages)
 

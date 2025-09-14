@@ -357,10 +357,10 @@ class AsyncvLLMServer(AsyncServerBase):
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
         )
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
-
         # Get final response
         final_res: Optional[RequestOutput] = None
         async for output in generator:
+            print(f"[AsyncvLLMServer.generate] output: {output}")
             final_res = output
         assert final_res is not None
 
@@ -368,7 +368,11 @@ class AsyncvLLMServer(AsyncServerBase):
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+        
+        result = TokenOutput(token_ids=token_ids, log_probs=log_probs)
+        print(f"[AsyncvLLMServer.generate] result: {result}")
+        
+        return result
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:

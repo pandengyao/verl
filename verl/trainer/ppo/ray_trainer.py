@@ -971,22 +971,64 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+                print(f"[Step {self.global_steps}] Added UIDs to batch, total samples: {len(batch.non_tensor_batch['uid'])}")
 
                 gen_batch = self._get_gen_batch(batch)
+                print(f"[Step {self.global_steps}] Generated batch size: {len(gen_batch.batch)}")
+                
+                # 打印gen_batch的详细内容
+                print("=" * 80)
+                print(f"STEP {self.global_steps} - GEN_BATCH CONTENT:")
+                print("=" * 80)
+                
+                # 打印batch (TensorDict) 内容
+                if gen_batch.batch is not None:
+                    print("GEN_BATCH (TensorDict):")
+                    for key, tensor in gen_batch.batch.items():
+                        print(f"  {key}: torch.Tensor, shape={tensor.shape}, dtype={tensor.dtype}")
+                        if tensor.numel() <= 20:
+                            print(f"    content: {tensor}")
+                        else:
+                            print(f"    sample values: {tensor.flatten()[:10].tolist()}...")
+                else:
+                    print("GEN_BATCH (TensorDict): None")
+                
+                # 打印non_tensor_batch内容
+                if gen_batch.non_tensor_batch is not None and len(gen_batch.non_tensor_batch) > 0:
+                    print("\nGEN_BATCH NON_TENSOR_BATCH:")
+                    for key, array in gen_batch.non_tensor_batch.items():
+                        print(f"  {key}: np.ndarray, shape={array.shape}, dtype={array.dtype}")
+                        if array.size <= 10:
+                            print(f"    content: {array}")
+                        else:
+                            print(f"    sample values: {array.flatten()[:5].tolist()}...")
+                else:
+                    print("\nGEN_BATCH NON_TENSOR_BATCH: None")
+                
+                # 打印meta_info内容
+                if gen_batch.meta_info is not None and len(gen_batch.meta_info) > 0:
+                    print(f"\nGEN_BATCH META_INFO: {gen_batch.meta_info}")
+                else:
+                    print(f"\nGEN_BATCH META_INFO: None")
+                
+                print("=" * 80)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                print(f"[Step {self.global_steps}] After repeat (n={self.config.actor_rollout_ref.rollout.n}): {len(gen_batch.batch)} samples")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        print(f"[Step {self.global_steps}] self.async_rollout_mode: {self.async_rollout_mode}")
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        print(f"[Step {self.global_steps}] Generated sequences output size: {len(gen_batch_output.batch)}")
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1013,7 +1055,9 @@ class RayPPOTrainer:
 
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    print(f"[Step {self.global_steps}] Batch after repeat: {len(batch.batch)} samples")
                     batch = batch.union(gen_batch_output)
+                    print(f"[Step {self.global_steps}] Batch after union with gen_output: {len(batch.batch)} samples")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1027,6 +1071,8 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    total_tokens = sum(batch.meta_info["global_token_num"])
+                    print(f"[Step {self.global_steps}] Total valid tokens: {total_tokens}")
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1036,8 +1082,10 @@ class RayPPOTrainer:
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            print(f"[Step {self.global_steps}] Launched async reward computation")
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            print(f"[Step {self.global_steps}] Computed rewards, shape: {reward_tensor.shape}")
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1047,6 +1095,7 @@ class RayPPOTrainer:
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        print(f"[Step {self.global_steps}] Computed old log probs, entropy: {entropy_agg.detach().item():.4f}")
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -1088,8 +1137,10 @@ class RayPPOTrainer:
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
+                            print(f"[Step {self.global_steps}] Applied KL penalty, metrics: {kl_metrics}")
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            print(f"[Step {self.global_steps}] Using token_level_scores as rewards")
 
                         # compute advantages, executed on the driver process
 
@@ -1106,6 +1157,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        print(f"[Step {self.global_steps}] Computed advantages using {self.config.algorithm.adv_estimator}")
 
                     # update critic
                     if self.use_critic:
@@ -1113,6 +1165,7 @@ class RayPPOTrainer:
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                        print(f"[Step {self.global_steps}] Updated critic, metrics: {critic_output_metrics}")
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1122,6 +1175,9 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        print(f"[Step {self.global_steps}] Updated actor, metrics: {actor_output_metrics}")
+                    else:
+                        print(f"[Step {self.global_steps}] Skipping actor update (critic warmup: {self.config.trainer.critic_warmup} > {self.global_steps})")
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

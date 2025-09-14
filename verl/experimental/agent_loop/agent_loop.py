@@ -486,6 +486,8 @@ class AgentLoopWorker:
         agent_name: str,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        print(f"[_run_agent_loop] Received agent_name: {agent_name}")
+        print(f"[_run_agent_loop] Received kwargs keys: {list(kwargs.keys())}")
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -498,6 +500,7 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+            print(f"[_run_agent_loop] Agent loop config: {agent_loop_config}")
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=_DummyConfig(config=self.config),
@@ -852,29 +855,255 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        print(f"[AgentLoop] Starting generate_sequences with {len(prompts)} prompts")
+        print(f"[AgentLoop] Prompts keys: {list(prompts.batch.keys())}")
+        print(f"[AgentLoop] Prompts non_tensor_batch keys: {list(prompts.non_tensor_batch.keys())}")
+        print(f"[AgentLoop] Prompts meta_info keys: {list(prompts.meta_info.keys())}")
+        
+        # 打印prompts的详细内容
+        print(f"[AgentLoop] === PROMPTS DETAILED CONTENT ===")
+        if prompts.batch is not None and len(prompts.batch) > 0:
+            print(f"[AgentLoop] Batch tensors:")
+            for key, tensor in prompts.batch.items():
+                print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+                print(f"    values: {tensor}")
+        
+        if prompts.non_tensor_batch:
+            print(f"[AgentLoop] Non-tensor batch:")
+            for key, value in prompts.non_tensor_batch.items():
+                print(f"  {key}: type={type(value)}, shape={getattr(value, 'shape', 'N/A')}")
+                print(f"    values: {value}")
+        
+        if prompts.meta_info:
+            print(f"[AgentLoop] Meta info:")
+            for key, value in prompts.meta_info.items():
+                print(f"  {key}: {value}")
+        print(f"[AgentLoop] === END PROMPTS CONTENT ===")
 
         if self.rm_micro_batch_size and len(prompts) % self.rm_micro_batch_size != 0:
             raise ValueError(
                 f"The length of prompts {len(prompts)} cannot divide the world size of rm_wg {self.rm_micro_batch_size}"
             )
+        
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            print("[AgentLoop] Waking up cache engine")
             self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-        output = DataProto.concat(outputs)
+            
+        def run_tasks(raw_prompts: list[list[dict[str, str]]]):
+            """
+            1. 发送任务到服务器获取task_id列表
+            2. 轮询任务状态直到完成
+            3. 获取完成的任务数据并返回
+            """
+            import requests
+            import time
+            import json
+            from typing import Dict, List, Any
+            
+            BASE_URL = "https://host:ip" 
+            STAGE = "1"  # 可以根据需要修改
+            
+            def start_tasks(prompts: List[str]) -> List[str]:
+                """发送任务到服务器,返回task_id列表"""
+                url = f"{BASE_URL}/v1/task/start"
+                payload = {
+                    "stage": STAGE,
+                    "prompt_list": prompts
+                }
+                
+                try:
+                    response = requests.post(url, json=payload, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data["code"] == 200:
+                        return data["data"]["task_id_list"]
+                    else:
+                        raise Exception(f"API error: {data['message']}")
+                        
+                except requests.exceptions.RequestException as e:
+                    raise Exception(f"Failed to start tasks: {e}")
+            
+            def check_task_status(task_ids: List[str]) -> Dict[str, str]:
+                """检查任务状态,返回task_id到status的映射"""
+                url = f"{BASE_URL}/v1/task/status"
+                params = {
+                    "task_id_list": ",".join(task_ids)
+                }
+                
+                try:
+                    response = requests.get(url, params=params, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data["code"] == 200:
+                        status_map = {}
+                        for task in data["data"]["task_list"]:
+                            status_map[task["task_id"]] = task["status"]
+                        return status_map
+                    else:
+                        raise Exception(f"API error: {data['message']}")
+                        
+                except requests.exceptions.RequestException as e:
+                    raise Exception(f"Failed to check task status: {e}")
+            
+            def get_task_data(task_id: str) -> str:
+                """获取完成的任务数据"""
+                url = f"{BASE_URL}/v1/data/get"
+                params = {"task_id": task_id}
+                
+                try:
+                    response = requests.get(url, params=params, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data["code"] == 200:
+                        return data["data"]["task_data"]
+                    else:
+                        raise Exception(f"API error: {data['message']}")
+                        
+                except requests.exceptions.RequestException as e:
+                    raise Exception(f"Failed to get task data for {task_id}: {e}")
+            
+            # 主处理逻辑
+            try:
+                print(f"[AgentLoop] Processing {len(raw_prompts)} prompts")
+                print(f"[AgentLoop] First prompt type: {type(raw_prompts[0])}")
+                print(f"[AgentLoop] First prompt content: {raw_prompts[0]}")
+                
+                # 1. 将raw_prompts转换为字符串列表
+                prompt_strings = []
+                for i, prompt in enumerate(raw_prompts):
+                    print(f"[AgentLoop] Processing prompt {i}: type={type(prompt)}")
+                    
+                    # raw_prompts是numpy数组，每个元素是一个list，包含字典
+                    # 只提取content内容
+                    if isinstance(prompt, list) and len(prompt) > 0:
+                        # 如果prompt是字典列表，只提取content
+                        if isinstance(prompt[0], dict):
+                            # 只取第一个消息的content内容
+                            content = prompt[0].get('content', '')
+                            prompt_strings.append(content)
+                            print(f"[AgentLoop] Extracted content {i}: {content[:100]}...")
+                        else:
+                            # 如果prompt直接是字符串
+                            prompt_strings.append(str(prompt))
+                            print(f"[AgentLoop] Using prompt {i} as string: {str(prompt)[:100]}...")
+                    else:
+                        # 处理其他情况
+                        prompt_strings.append(str(prompt))
+                        print(f"[AgentLoop] Fallback for prompt {i}: {str(prompt)[:100]}...")
+                
+                print(f"[AgentLoop] Starting {len(prompt_strings)} tasks")
+                
+                # 2. 发送任务到服务器
+                task_ids = start_tasks(prompt_strings)
+                print(f"[AgentLoop] Received {len(task_ids)} task IDs: {task_ids}")
+                
+                # 3. 轮询任务状态并收集结果
+                # 使用字典来保持顺序，key是task_id，value是task_data
+                output_dict = {}
+                completed_tasks = set()
+                max_wait_time = 18000  # 最大等待时间30分钟
+                start_time = time.time()
+                
+                while len(completed_tasks) < len(task_ids):
+                    # 检查是否超时
+                    if time.time() - start_time > max_wait_time:
+                        raise Exception(f"Timeout: Only {len(completed_tasks)}/{len(task_ids)} tasks completed")
+                    
+                    # 检查所有未完成任务的状态
+                    remaining_task_ids = [tid for tid in task_ids if tid not in completed_tasks]
+                    status_map = check_task_status(remaining_task_ids)
+                    
+                    # 处理完成的任务
+                    for task_id in remaining_task_ids:
+                        if task_id in status_map:
+                            status = status_map[task_id]
+                            if status == "end":
+                                print(f"[AgentLoop] Task {task_id} completed, fetching data...")
+                                task_data = get_task_data(task_id)
+                                output_dict[task_id] = task_data
+                                completed_tasks.add(task_id)
+                            elif status == "failed":
+                                print(f"[AgentLoop] Task {task_id} failed")
+                                output_dict[task_id] = None
+                                completed_tasks.add(task_id)
+                    
+                    # 如果还有未完成的任务，等待一段时间后继续轮询
+                    if len(completed_tasks) < len(task_ids):
+                        print(f"[AgentLoop] {len(completed_tasks)}/{len(task_ids)} tasks completed, waiting...")
+                        time.sleep(0.01)  # 等待10ms
+                
+                # 4. 按照task_ids的顺序构建最终output，确保顺序一致
+                output = []
+                for task_id in task_ids:
+                    if task_id in output_dict:
+                        output.append(output_dict[task_id])
+                    else:
+                        print(f"[AgentLoop] Warning: No result found for task_id {task_id}")
+                        output.append(None)
+                
+                print(f"[AgentLoop] All {len(task_ids)} tasks completed successfully")
+                return output
+                
+            except Exception as e:
+                print(f"[AgentLoop] Error in run_tasks: {e}")
+                # 返回部分结果或空列表
+                return output if 'output' in locals() else []
+        
+        agent_mode = False
+        if agent_mode:
+            output = run_tasks(prompts.non_tensor_batch["raw_prompt"])
+        else:
+            print(f"[AgentLoop] Chunking prompts into {len(self.agent_loop_workers)} chunks")
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            print(f"[AgentLoop] Chunk sizes: {[len(chunk) for chunk in chunkes]}")
+            
+            print("[AgentLoop] Dispatching to agent loop workers")
+            outputs = ray.get(
+                [
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                ]
+            )
+            output = DataProto.concat(outputs)
+            
+        print(f"[AgentLoop] Final output size: {len(output)}")
+        print(f"[AgentLoop] Final output keys: {list(output.batch.keys())}")
+        print(f"[AgentLoop] Final output non_tensor_batch keys: {list(output.non_tensor_batch.keys())}")
+        print(f"[AgentLoop] Final output meta_info keys: {list(output.meta_info.keys())}")
+        
+        # 打印output的详细内容
+        print(f"[AgentLoop] === OUTPUT DETAILED CONTENT ===")
+        if output.batch is not None and len(output.batch) > 0:
+            print(f"[AgentLoop] Output batch tensors:")
+            for key, tensor in output.batch.items():
+                print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+                print(f"    values: {tensor}")
+        
+        if output.non_tensor_batch:
+            print(f"[AgentLoop] Output non-tensor batch:")
+            for key, value in output.non_tensor_batch.items():
+                print(f"  {key}: type={type(value)}, shape={getattr(value, 'shape', 'N/A')}")
+                print(f"    values: {value}")
+        
+        if output.meta_info:
+            print(f"[AgentLoop] Output meta info:")
+            for key, value in output.meta_info.items():
+                print(f"  {key}: {value}")
+        print(f"[AgentLoop] === END OUTPUT CONTENT ===")
+        
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
+        print(f"[AgentLoop] Performance timing: {timing}")
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        print(f"[AgentLoop] Returning output with {len(output)} sequences")
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

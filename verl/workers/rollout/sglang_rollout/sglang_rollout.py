@@ -1027,12 +1027,27 @@ class SGLangRollout(BaseRollout):
         kwargs["n"] = 1  # group size is supported in preprocess
         return_logprob = kwargs.pop("logprobs", False)
 
+        print(f"[SGLang] Calling engine.async_generate with:")
+        print(f"  input_ids: {generation_prompt_ids}")
+        print(f"  sampling_params: {kwargs}")
+        print(f"  return_logprob: {return_logprob}")
+        print(f"  image_data: {image_data}")
+        
         output = await self._engine.async_generate(
             input_ids=generation_prompt_ids,
             sampling_params=kwargs,
             return_logprob=return_logprob,
             image_data=image_data,
         )
+        
+        print(f"[SGLang] Engine output: {output}")
+        print(f"[SGLang] Output type: {type(output)}")
+        print(f"[SGLang] Output keys: {output.keys() if isinstance(output, dict) else 'Not a dict'}")
+        if isinstance(output, dict) and "output_ids" in output:
+            print(f"[SGLang] Generated token IDs: {output['output_ids']}")
+        if isinstance(output, dict) and "meta_info" in output:
+            print(f"[SGLang] Meta info: {output['meta_info']}")
+        
         return output
 
     async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
